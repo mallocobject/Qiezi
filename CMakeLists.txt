@@ -7,11 +7,11 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 include(FetchContent)
 
-FetchContent_Declare(
-    minifb
-    GIT_REPOSITORY https://github.com/emoon/minifb.git
-    GIT_TAG master
-)
+# FetchContent_Declare(
+#     minifb
+#     GIT_REPOSITORY https://github.com/emoon/minifb.git
+#     GIT_TAG master
+# )
 
 FetchContent_Declare(
     glm
@@ -19,7 +19,7 @@ FetchContent_Declare(
     GIT_TAG master
 )
 
-FetchContent_MakeAvailable(minifb glm)
+FetchContent_MakeAvailable(glm)
 
 
 file(GLOB_RECURSE APP_SOURCES CONFIGURE_DEPENDS
@@ -31,13 +31,15 @@ file(GLOB_RECURSE APP_SOURCES CONFIGURE_DEPENDS
 
 add_executable(Qiezi ${APP_SOURCES})
 
+target_compile_definitions(Qiezi PRIVATE
+    ASSETS="${CMAKE_CURRENT_SOURCE_DIR}/assets")
+
 target_include_directories(Qiezi PRIVATE
     ${CMAKE_SOURCE_DIR}/third_party
 )
 
 
 target_link_libraries(Qiezi PRIVATE
-    minifb
     glm::glm
 )
 
