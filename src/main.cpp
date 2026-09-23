@@ -1,91 +1,49 @@
-#include "glm/ext/quaternion_geometric.hpp"
+#include "buffer.hpp"
+#include "define.hpp"
 #include "glm/fwd.hpp"
 #include "glm/geometric.hpp"
 #include "glm/matrix.hpp"
-#include "obj_vertices.h"
-#include "our_gl.h"
-#include <algorithm>
-#include <cmath>
-#include <complex>
-#include <cstddef>
+#include "obj_loader.hpp"
+#include "rasterizer.hpp"
+#include "shader.hpp"
+#include "texture.hpp"
+#include "triangle.hpp"
+
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
-#include <glm/ext.hpp>
-#include <glm/glm.hpp>
-#include <iterator>
 #include <memory>
-#include <numeric>
 #include <optional>
-#include <random>
-#include <ranges>
 #include <string>
-#include <sys/types.h>
-#include <tuple>
-#include <utility>
 #include <vector>
 
-using Color = glm::vec3;
-namespace rg = std::ranges;
+namespace {
 
-inline constexpr Color WHITE{1.f, 1.f, 1.f};
-inline constexpr Color BLACK{0, 0, 0};
-inline constexpr Color RED{1.f, 0, 0};
-inline constexpr Color GREEN{0, 1.f, 0};
-inline constexpr Color BLUE{0, 0, 1.f};
-
-inline constexpr const int WIDTH = 800;
-inline constexpr const int HEIGHT = 800;
-
-extern std::unique_ptr<float[]> zbuffer;
-extern glm::mat4 model_view, perspective;
-
-namespace detail {
-template <typename T>
-concept Arithmetic = std::is_arithmetic_v<T> && !std::same_as<T, bool>;
-
-template <Arithmetic T>
-struct Random {
-    T operator()(T a = 0, T b = 1) const {
-        thread_local std::mt19937 rng{std::random_device{}()};
-
-        if constexpr (std::integral<T>) {
-            assert(a <= b);
-            std::uniform_int_distribution<T> dist(a, b);
-            return dist(rng);
-        } else {
-            assert(a < b);
-            thread_local std::uniform_real_distribution<T> dist{T{0}, T{1}};
-            return a + (b - a) * dist(rng);
-        }
-    }
-};
-
-} // namespace detail
-
-inline constexpr detail::Random<float> random_float{};
-inline constexpr detail::Random<int> random_int{};
-
-// 把帧缓冲写成 PPM(P6)。头部是文本，后面直接跟 RGB 字节，
-bool write_ppm(const char *path, Buffer &buffer) {
+/// 把帧缓冲写成 PPM(P6)。
+///
+/// 帧缓冲按「屏幕坐标 y 向上」存储（viewport 不做 y 翻转，和 NDC 一致），
+/// 而 PPM 的行 0 在图像顶部，所以这里做全项目【唯一】的垂直翻转。
+bool write_ppm(const char *path, Buffer<uint32_t> &buffer) {
     FILE *fp = std::fopen(path, "wb");
     if (fp == nullptr) {
         std::fprintf(stderr, "cannot open %s for writing\n", path);
         return false;
     }
 
-    std::fprintf(fp, "P6\n%d %d\n255\n", WIDTH, HEIGHT);
+    const int w = buffer.w();
+    const int h = buffer.h();
+    std::fprintf(fp, "P6\n%d %d\n255\n", w, h);
 
-    // 打包成连续 RGB 再一次性写出，比逐像素 fputc 快得多。
-    std::vector<unsigned char> rgb(static_cast<size_t>(WIDTH) * HEIGHT * 3);
-    for (int y = 0; y < HEIGHT; ++y) {
-        const int src_y = HEIGHT - 1 - y; // 源行号倒过来
-        for (int x = 0; x < WIDTH; ++x) {
-            const uint32_t px = buffer(x, src_y);
-            const size_t o = (static_cast<size_t>(y) * WIDTH + x) * 3;
-            rgb[o + 0] = static_cast<unsigned char>((px >> 16) & 0xFF);
-            rgb[o + 1] = static_cast<unsigned char>((px >> 8) & 0xFF);
-            rgb[o + 2] = static_cast<unsigned char>(px & 0xFF);
+    std::vector<unsigned char> rgb(static_cast<size_t>(w) * h * 3);
+    for (int y = 0; y < h; ++y) {
+        const uint32_t *src =
+            buffer.data() + static_cast<size_t>(h - 1 - y) * w;
+        unsigned char *dst = rgb.data() + static_cast<size_t>(y) * w * 3;
+        for (int x = 0; x < w; ++x) { // 这里还是逐像素：要做 0xRRGGBB -> 3 字节
+            const uint32_t px = src[x];
+            dst[3 * x + 0] = static_cast<unsigned char>((px >> 16) & 0xFF);
+            dst[3 * x + 1] = static_cast<unsigned char>((px >> 8) & 0xFF);
+            dst[3 * x + 2] = static_cast<unsigned char>(px & 0xFF);
         }
     }
 
@@ -98,278 +56,194 @@ bool write_ppm(const char *path, Buffer &buffer) {
     return true;
 }
 
-// bool write_pgm(const char *path) {
-//     FILE *fp = std::fopen(path, "wb");
-//     if (fp == nullptr) {
-//         std::fprintf(stderr, "cannot open %s for writing\n", path);
-//         return false;
-//     }
+struct LambertTextureShader final : public Shader {
+    std::optional<Color> fragment(const FragmentIn &in,
+                                  const ShaderContext &ctx) const override {
+        if (!diffuse && !normal_map) {
+            return in.color;
+        }
 
-//     std::fprintf(fp, "P5\n%d %d\n255\n", WIDTH, HEIGHT);
+        // ---------------- 1) 由逐三角形数据构造 TBN ----------------
+        //
+        //   det    = duv1.x*duv2.y - duv1.y*duv2.x   （UV 面积的 2 倍）
+        //   T_raw  = (edge1*duv2.y - edge2*duv1.y) / det
+        //   handed = sign(det)   —— UV 镜像时副切线要反号
+        //
+        // 用【插值法线】正交化 —— 标准做法。它保留了"这模型是曲面"的信息，
+        // 基础明暗是平滑的。理论误差（插值法线和 edge 不严格共面）在视觉上
+        // 可忽略；真正的硬边在模型上是顶点拆开的，那里两者本来就一致。
+        const float det = glm::determinant(glm::mat2{in.duv1, in.duv2});
+        if (std::abs(det) < consts::kMinNormalizeLength) {
+            return in.color; // UV 退化，构造不出切线基
+        }
+        const float inv_det = 1.f / det;
 
-//     // 灰度每像素 1 字节，不再是 3 字节
-//     std::vector<unsigned char> gray(static_cast<size_t>(WIDTH) * HEIGHT);
-//     for (int i = gray.size() - 1; i >= 0; --i) {
-//         // 取一个通道即可，灰度时 R=G=B
-//         gray[i] = static_cast<unsigned
-//         char>(static_cast<uint32_t>(zbuffer[i]) &
-//                                              0xFF);
-//     }
+        const glm::vec3 N = glm::normalize(in.normal);
 
-//     const size_t written = std::fwrite(gray.data(), 1, gray.size(), fp);
-//     std::fclose(fp);
-//     return written == gray.size();
-// }
+        const glm::vec3 T_raw =
+            (in.edge1 * in.duv2.y - in.edge2 * in.duv1.y) * inv_det;
+        glm::vec3 T = T_raw - N * glm::dot(N, T_raw); // Gram-Schmidt
+        const float tlen = glm::length(T);
+        if (tlen < consts::kMinNormalizeLength) {
+            return in.color;
+        }
+        T /= tlen;
 
-// inline uint32_t color_to_uint32(const Color &color) {
-//     uint32_t r = glm::clamp(
-//         static_cast<uint32_t>(std::round(color.r * 255.f)), 0u, 255u);
-//     uint32_t g = glm::clamp(
-//         static_cast<uint32_t>(std::round(color.g * 255.f)), 0u, 255u);
-//     uint32_t b = glm::clamp(
-//         static_cast<uint32_t>(std::round(color.b * 255.f)), 0u, 255u);
+        const float handed = (det < 0.f) ? -1.f : 1.f;
+        const glm::vec3 B = glm::cross(N, T) * handed;
+        const glm::mat3 TBN{T, B, N}; // 列 = T, B, N
 
-//     return (r << 16) | (g << 8) | b;
-// }
+        const glm::vec3 tn = normal_map
+                                 ? normal_map->sample(in.texcoord) * 2.f - 1.f
+                                 : glm::vec3{0.f, 0.f, 1.f};
 
-// inline void plot(const glm::i32vec2 &dot, const Color &color) {
-//     buffer[dot.y * WIDTH + dot.x] = color_to_uint32(color);
-// }
+        // 法线强度：只缩放切向分量。缩放 z 会在 normalize
+        // 后被抵消，等于没效果。 strength=0 时 xy 归零 -> 归一化得到 (0,0,1) ->
+        // 完全平坦
+        const float k = std::max(0.f, normal_strength);
+        const glm::vec3 tn_scaled =
+            glm::normalize(glm::vec3{tn.x * k, tn.y * k, tn.z});
 
-// inline void plotz(const glm::i32vec2 &dot, float z) {
-//     zbuffer[dot.y * WIDTH + dot.x] = z;
-// }
+        // 切线空间 -> 相机空间
+        const glm::vec3 n = glm::normalize(TBN * tn_scaled);
 
-// void draw_lineH(glm::i32vec2 a, glm::i32vec2 b, const Color &color) {
-//     if (a.x > b.x) {
-//         std::swap(a, b);
-//     }
-//     int dx = b.x - a.x;
-//     int dy = b.y - a.y;
-//     int sign = dy > 0 ? 1 : -1;
-//     dy *= sign;
-//     int D = 2 * dy - dx;
-//     int y = a.y;
-//     for (int x = a.x; x <= b.x; x++) {
-//         plot(glm::i32vec2{x, y}, color);
-//         if (D > 0) {
-//             y += sign;
-//             D -= 2 * dx;
-//         }
-//         D += 2 * dy;
-//     }
-// }
+        const Color albedo = diffuse ? diffuse->sample(in.texcoord) : in.color;
 
-// void draw_lineV(glm::i32vec2 a, glm::i32vec2 b, const Color &color) {
-//     if (a.y > b.y) {
-//         std::swap(a, b);
-//     }
-//     int dx = b.x - a.x;
-//     int dy = b.y - a.y;
-//     int sign = dx > 0 ? 1 : -1;
-//     dx *= sign;
-//     int D = 2 * dx - dy;
-//     int x = a.x;
-//     for (int y = a.y; y <= b.y; y++) {
-//         plot(glm::i32vec2{x, y}, color);
-//         if (D > 0) {
-//             x += sign;
-//             D -= 2 * dy;
-//         }
-//         D += 2 * dx;
-//     }
-// }
+        // 高光贴图：灰度遮罩，控制"哪里亮哪里哑"。
+        // 它数值很暗（P90 只有 0.05），所以要乘一个增益才看得出铠甲的光泽。
+        // 注意它只调制【高光】，不调制漫反射 —— 这是它和 diffuse 的分工。
+        const float gloss =
+            specular_map
+                ? glm::min(1.f,
+                           specular_map->sample(in.texcoord).r * specular_gain)
+                : 1.f;
 
-// inline glm::i32vec2 round_to_pixel(const glm::vec2 &p) {
-//     return glm::i32vec2{static_cast<int>(std::lround(p.x)),
-//                         static_cast<int>(std::lround(p.y))};
-// }
+        // 自发光贴图：眼睛和胸口的宝石。它不参与光照计算，最后直接加上去。
+        // 同样很暗（最大只有 0.38），要放大。
+        const Color glow =
+            glow_map ? glow_map->sample(in.texcoord) * glow_gain : Color{0.f};
 
-// void draw_line(const glm::vec2 &a, const glm::vec2 &b, const Color &color) {
-//     if (std::abs(a.x - b.x) >= std::abs(a.y - b.y)) {
-//         draw_lineH(round_to_pixel(a), round_to_pixel(b), color);
-//     } else {
-//         draw_lineV(round_to_pixel(a), round_to_pixel(b), color);
-//     }
-// }
+        const glm::vec3 p = in.view_position; // 相机空间位置
+        const glm::vec3 v = glm::normalize(-in.view_position);
 
-// auto bounding_box(const glm::vec2 v[3]) {
-//     const glm::vec2 lo{std::min({v[0].x, v[1].x, v[2].x}),
-//                        std::min({v[0].y, v[1].y, v[2].y})};
-//     const glm::vec2 hi{std::max({v[0].x, v[1].x, v[2].x}),
-//                        std::max({v[0].y, v[1].y, v[2].y})};
-//     return std::pair<glm::i32vec2, glm::i32vec2>{
-//         glm::i32vec2{std::max(static_cast<int>(std::floor(lo.x)), 0),
-//                      std::max(static_cast<int>(std::floor(lo.y)), 0)},
-//         glm::i32vec2{std::min(static_cast<int>(std::ceil(hi.x)), WIDTH - 1),
-//                      std::min(static_cast<int>(std::ceil(hi.y)), HEIGHT -
-//                      1)}};
-// }
+        Color result = albedo * ambient;
+        for (const glm::vec3 &lw : lights_world) {
+            // 光源位置变到相机空间，否则和 n 不在同一空间
+            const glm::vec3 lv = glm::vec3{ctx.model_view * glm::vec4{lw, 1.f}};
+            const glm::vec3 l =
+                glm::normalize(lv - p); // 表面 -> 光源（点光源）
 
-// bool is_inner_triangle(const glm::vec2 &p,
-//                        const glm::vec2 &v0,
-//                        const glm::vec2 &v1,
-//                        const glm::vec2 &v2) {
-//     const glm::vec2 v0p = p - v0;
-//     const glm::vec2 v1p = p - v1;
-//     const glm::vec2 v2p = p - v2;
-//     const glm::vec2 v0v1 = v1 - v0;
-//     const glm::vec2 v1v2 = v2 - v1;
-//     const glm::vec2 v2v0 = v0 - v2;
+            const glm::vec3 hv = l + v;
+            const glm::vec3 h = glm::length(hv) > consts::kMinNormalizeLength
+                                    ? glm::normalize(hv)
+                                    : glm::vec3{0.f};
+            const float diff = std::max(0.f, glm::dot(n, l));
+            const float spec =
+                std::pow(std::max(0.f, glm::dot(n, h)), shininess);
 
-//     const float a = v0p.x * v0v1.y - v0p.y * v0v1.x;
-//     const float b = v1p.x * v1v2.y - v1p.y * v1v2.x;
-//     const float c = v2p.x * v2v0.y - v2p.y * v2v0.x;
+            // 漫反射用贴图色，高光用白色（强度由高光贴图调制）
+            result += albedo * (diffuse_factor * diff) +
+                      Color{1.f, 1.f, 1.f} * (specular * gloss * spec);
+        }
 
-//     return a >= 0 && b >= 0 && c >= 0 || a < 0 && b < 0 && c < 0;
-// }
+        // 自发光最后叠加：不受光照影响，也不该被 N·L 调制
+        result += glow;
 
-// float dummy_area(const glm::vec2 v[3]) {
-//     const glm::vec2 v0v1 = v[1] - v[0];
-//     const glm::vec2 v0v2 = v[2] - v[0];
-
-//     return v0v1.x * v0v2.y - v0v1.y * v0v2.x;
-// }
-
-// auto alpha_beta_gamma(const glm::vec2 &p,
-//                       const glm::vec2 &v0,
-//                       const glm::vec2 &v1,
-//                       const glm::vec2 &v2) {
-//     float total_area = dummy_area(v0, v1, v2);
-//     if (total_area == 0) {
-//         return std::tuple<float, float, float>{};
-//     }
-//     float inv_total_area = 1.f / total_area;
-//     float alpha_area = dummy_area(p, v1, v2);
-//     float beta_area = dummy_area(v0, p, v2);
-//     float gamma_area = dummy_area(v0, v1, p);
-
-//     return std::make_tuple<float, float, float>(alpha_area * inv_total_area,
-//                                                 beta_area * inv_total_area,
-//                                                 gamma_area * inv_total_area);
-// }
-
-// void draw_triangle(const glm::vec4 ndc[3], const Color &color) {
-//     const glm::vec2 screen[3]{
-//         viewport(ndc[0], WIDTH / 16.f, WIDTH / 16.f),
-//         viewport(ndc[1], WIDTH / 16.f, WIDTH / 16.f),
-//         viewport(ndc[2], WIDTH / 16.f, WIDTH / 16.f),
-//     };
-
-//     const glm::mat3 ABC{
-//         {screen[0], 1},
-//         {screen[1], 1},
-//         {screen[2], 1},
-//     };
-
-//     auto [bbmin, bbmax] = bounding_box(screen);
-//     if (glm::determinant(ABC) < 1.f) {
-//         return;
-//     }
-
-//     for (int y = bbmin.y; y <= bbmax.y; y++) {
-//         for (int x = bbmin.x; x <= bbmax.x; x++) {
-//             const glm::vec3 dot{x + 0.5f, y + 0.5f, 1.f}; // 像素中心
-//             const glm::vec3 bc = glm::inverse(ABC) * dot;
-//             if (bc.x >= 0 && bc.y >= 0 && bc.z >= 0) {
-//                 float z = glm::dot(bc, glm::vec3{ndc[0].z, ndc[1].z,
-//                 ndc[2].z}); if (z > zbuffer[y * WIDTH + x]) {
-//                     plotz(dot, z);
-//                     plot(dot, color);
-//                 }
-//             }
-//         }
-//     }
-// }
-
-struct RandomShader : IShader {
-    std::optional<Color> fragment(const glm::vec3 &bar) const {
-        Color gl_color{1.f};
-        glm::vec3 n =
-            glm::normalize(glm::cross(tri[1] - tri[0], tri[2] - tri[0]));
-        float ambinet = 0.1f;
-        float diff = std::max(0.f, glm::dot(n, l));
-        float spec =
-            std::pow(std::max(0.f, glm::dot(glm::normalize(l + v), n)), 35);
-
-        return gl_color * std::min(1.f, ambinet + 0.1f * diff + 0.9f * spec);
+        return glm::min(result, Color{1.f, 1.f, 1.f}); // 防止过曝
     }
 
-    Color color;
-    glm::vec3 tri[3];
-    glm::vec3 l;
-    glm::vec3 v;
+    std::shared_ptr<Texture> diffuse;    ///< 漫反射贴图（反照率）
+    std::shared_ptr<Texture> normal_map; ///< 切线空间法线贴图
+    std::shared_ptr<Texture> specular_map; ///< 高光遮罩（灰度，调制高光强度）
+    std::shared_ptr<Texture> glow_map; ///< 自发光（眼睛、胸口宝石）
+    std::vector<glm::vec3> lights_world; ///< 光源位置（世界空间）
+    Color ambient{0.15f};                ///< 环境光系数
+    float diffuse_factor{0.45f};         ///< 漫反射系数
+    float specular{0.40f};               ///< 高光系数
+    float shininess{35.f};               ///< 高光指数
+    float normal_strength{1.f}; ///< 法线强度（1=原始, 0=平坦）
+    float specular_gain{8.f};   ///< 高光贴图的增益（它数值很暗）
+    float glow_gain{3.f};       ///< 自发光增益（它数值很暗）
 };
 
-// b: x
-// n: y
-// t: -z
-int main(int argc, char **argv) {
-    const char *ppm_path = (argc > 1) ? argv[1] : "out.ppm";
-    const char *pgm_path = (argc > 2) ? argv[2] : "out.pgm";
+} // namespace
+
+int main() {
+    const char *ppm_path = "out.ppm";
+    const char *obj_path = ASSETS "/diablo3_pose/diablo3_pose.obj";
+    const char *diffuse_path = ASSETS "/diablo3_pose/diablo3_pose_diffuse.tga";
+    const char *normal_path =
+        ASSETS "/diablo3_pose/diablo3_pose_nm_tangent.tga";
+    const char *specular_path = ASSETS "/diablo3_pose/diablo3_pose_spec.tga";
+    const char *glow_path = ASSETS "/diablo3_pose/diablo3_pose_glow.tga";
 
     std::string error;
-    std::optional<qiezi::Mesh> mesh =
-        qiezi::load_obj(ASSETS "/diablo3_pose/diablo3_pose.obj", &error);
+    auto mesh = ObjLoader::Load(obj_path, &error);
     if (!mesh) {
         std::fprintf(stderr, "load failed: %s\n", error.c_str());
         return 1;
     }
+    std::fprintf(stderr,
+                 "loaded: %zu vertices, %zu triangles\n",
+                 mesh->vertices.size(),
+                 mesh->triangle_count());
 
-    // const auto model_to_screen = [&](const glm::vec3 &v) {
-    //     return glm::vec3{(v.x + 1.f) * WIDTH * 0.5f,
-    //                      (1.f - v.y) * HEIGHT * 0.5f,
-    //                      (v.z + 1.f) * 255 * 0.5f};
-    // };
+    Camera camera{};
+    camera.eye = {-1.f, 0.f, 2.f};
+    camera.center = {0.f, 0.f, 0.f};
+    camera.up = {0.f, 1.f, 0.f};
+    camera.fov = glm::radians(60.f);
+    camera.n = 0.1f;
+    camera.f = 100.f;
+    camera.w = 800;
+    camera.h = 800;
 
-    std::vector<unsigned int> order(mesh->triangle_count());
-    std::iota(std::begin(order), std::end(order), 0u);
+    Rasterizer r(camera);
 
-    // rg::sort(order, [&mesh](unsigned int lhs, unsigned int rhs) {
-    //     const auto z_of = [&mesh](unsigned int tri) {
-    //         const glm::vec3 &a = mesh->vertices[mesh->indices[3 * tri +
-    //         0]]; const glm::vec3 &b = mesh->vertices[mesh->indices[3 *
-    //         tri + 1]]; const glm::vec3 &c =
-    //         mesh->vertices[mesh->indices[3 * tri + 2]]; return (a.z + b.z
-    //         + c.z) / 3.f;
-    //     };
-    //     return z_of(lhs) < z_of(rhs);
-    // });
+    // 就地构造并接管所有权；emplace_shader 返回引用，方便继续设参数
+    LambertTextureShader &shader = r.emplace_shader<LambertTextureShader>();
 
-    Buffer buffer(WIDTH, HEIGHT);
-
-    constexpr const glm::vec3 eye{-1.f, 0, 2.f};
-    constexpr const glm::vec3 center{0, 0, 0};
-    constexpr const glm::vec3 up{0, 1.f, 0};
-
-    lookat(eye, center, up);
-    init_perspective(glm::length(eye - center));
-    init_viewport(WIDTH / 16, HEIGHT / 16, WIDTH * 7 / 8, HEIGHT * 7 / 8);
-    init_zbuffer(WIDTH, HEIGHT);
-
-    for (unsigned int tri : order) {
-        RandomShader shader;
-        shader.tri[0] = mesh->vertices[mesh->indices[3 * tri + 0]];
-        shader.tri[1] = mesh->vertices[mesh->indices[3 * tri + 1]];
-        shader.tri[2] = mesh->vertices[mesh->indices[3 * tri + 2]];
-        const glm::vec3 face_center =
-            (shader.tri[0] + shader.tri[1] + shader.tri[2]) / 3.f;
-        shader.l = glm::normalize(center - face_center);
-        shader.v = glm::normalize(eye - face_center);
-        Triangle clip{
-            perspective * model_view * glm::vec4{shader.tri[0], 1.f},
-            perspective * model_view * glm::vec4{shader.tri[1], 1.f},
-            perspective * model_view * glm::vec4{shader.tri[2], 1.f},
-        };
-        for (int c = 0; c < 3; c++) {
-            shader.color[c] = random_float();
-        }
-        rasterize(clip, shader, buffer);
-    }
-
-    if (!write_ppm(ppm_path, buffer)) {
+    auto diffuse = Texture::LoadTga(diffuse_path, &error);
+    if (!diffuse) {
+        std::fprintf(stderr, "diffuse load failed: %s\n", error.c_str());
         return 1;
     }
+    auto normal_map = Texture::LoadTga(normal_path, &error);
+    auto specular_map = Texture::LoadTga(specular_path, &error);
+    auto glow_map = Texture::LoadTga(glow_path, &error);
+    if (!normal_map || !specular_map || !glow_map) {
+        std::fprintf(stderr, "texture load failed: %s\n", error.c_str());
+        return 1;
+    }
+    std::fprintf(
+        stderr,
+        "textures: diffuse %dx%d, normal %dx%d, spec %dx%d, glow %dx%d\n",
+        diffuse->width(),
+        diffuse->height(),
+        normal_map->width(),
+        normal_map->height(),
+        specular_map->width(),
+        specular_map->height(),
+        glow_map->width(),
+        glow_map->height());
 
+    shader.diffuse = std::make_shared<Texture>(std::move(*diffuse));
+    shader.normal_map = std::make_shared<Texture>(std::move(*normal_map));
+    shader.specular_map = std::make_shared<Texture>(std::move(*specular_map));
+    shader.glow_map = std::make_shared<Texture>(std::move(*glow_map));
+    shader.lights_world = {
+        {2.f, 3.f, 4.f},  // 主光：右上前方
+        {-3.f, 1.f, 2.f}, // 补光：左侧
+    };
+
+    // draw() 不自动清屏，必须自己调 —— 否则 zbuffer 读的是未初始化内存
+    r.clear(BufferType::kColor | BufferType::kDepth);
+
+    r.draw(*mesh);
+
+    if (!write_ppm(ppm_path, r.buffer())) {
+        return 1;
+    }
+    std::fprintf(stderr, "wrote %s\n", ppm_path);
     return 0;
 }
