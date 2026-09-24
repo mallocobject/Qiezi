@@ -6,6 +6,8 @@
 #include "obj_loader.hpp"
 #include "rasterizer.hpp"
 #include "shader.hpp"
+#include "light.hpp"
+#include "shadow.hpp"
 #include "texture.hpp"
 #include "triangle.hpp"
 
@@ -104,47 +106,71 @@ struct LambertTextureShader final : public Shader {
         const glm::vec3 tn_scaled =
             glm::normalize(glm::vec3{tn.x * k, tn.y * k, tn.z});
 
-        // 切线空间 -> 相机空间
+        // 切线空间 -> 世界空间
         const glm::vec3 n = glm::normalize(TBN * tn_scaled);
 
         const Color albedo = diffuse ? diffuse->sample(in.texcoord) : in.color;
 
-        // 高光贴图：灰度遮罩，控制"哪里亮哪里哑"。
-        // 它数值很暗（P90 只有 0.05），所以要乘一个增益才看得出铠甲的光泽。
-        // 注意它只调制【高光】，不调制漫反射 —— 这是它和 diffuse 的分工。
         const float gloss =
             specular_map
                 ? glm::min(1.f,
                            specular_map->sample(in.texcoord).r * specular_gain)
                 : 1.f;
 
-        // 自发光贴图：眼睛和胸口的宝石。它不参与光照计算，最后直接加上去。
-        // 同样很暗（最大只有 0.38），要放大。
         const Color glow =
             glow_map ? glow_map->sample(in.texcoord) * glow_gain : Color{0.f};
 
-        const glm::vec3 p = in.view_position; // 相机空间位置
-        const glm::vec3 v = glm::normalize(-in.view_position);
+        const glm::vec3 p = in.world_position; // 世界空间位置
+        const glm::vec3 v =
+            glm::normalize(ctx.camera_position - in.world_position);
 
-        Color result = albedo * ambient;
-        for (const glm::vec3 &lw : lights_world) {
-            // 光源位置变到相机空间，否则和 n 不在同一空间
-            const glm::vec3 lv = glm::vec3{ctx.model_view * glm::vec4{lw, 1.f}};
-            const glm::vec3 l =
-                glm::normalize(lv - p); // 表面 -> 光源（点光源）
+        // ---------------- 光照 ----------------
+        //
+        // 全在世界空间。三种量分开累加，因为阴影只该影响【直接光照】，
+        // 环境项不受遮挡影响。
+        Color ambient_sum{0.f};
+        Color direct_sum{0.f};
+
+        for (std::size_t li = 0; li < lights.size(); ++li) {
+            const Light &light = lights[li];
+
+            // 环境项：不参与阴影
+            ambient_sum += albedo * light.ambient;
+
+            // 这盏灯是否投射阴影（查阴影贴图）
+            float lit = 1.f;
+            if (shadow != nullptr && shadow->valid() &&
+                li == shadow_light) {
+                const glm::vec3 to_light = light.to_light(in.world_position);
+                lit = shadow->sample(
+                    in.world_position, glm::normalize(in.normal), to_light);
+                // 0=全黑太硬，抬一点让阴影里有环境光
+                lit = shadow_strength + (1.f - shadow_strength) * lit;
+            }
+
+            // 表面 -> 光源（点光源逐片段不同，平行光恒定）
+            const glm::vec3 l = light.to_light(in.world_position);
+            const float ndl = std::max(0.f, glm::dot(n, l));
+            if (ndl <= 0.f && light.specular == Color{0.f}) {
+                continue; // 背面且无高光，这盏灯没有贡献
+            }
 
             const glm::vec3 hv = l + v;
             const glm::vec3 h = glm::length(hv) > consts::kMinNormalizeLength
                                     ? glm::normalize(hv)
                                     : glm::vec3{0.f};
-            const float diff = std::max(0.f, glm::dot(n, l));
-            const float spec =
-                std::pow(std::max(0.f, glm::dot(n, h)), shininess);
 
-            // 漫反射用贴图色，高光用白色（强度由高光贴图调制）
-            result += albedo * (diffuse_factor * diff) +
-                      Color{1.f, 1.f, 1.f} * (specular * gloss * spec);
+            // 高光用【法线贴图扰动后】的法线 —— 这样凹凸上的高光才跟着走
+            const float spec =
+                std::pow(std::max(0.f, glm::dot(n, h)), light.shininess);
+
+            direct_sum +=
+                (albedo * light.diffuse * ndl +
+                 Color{1.f, 1.f, 1.f} * (light.specular * gloss * spec)) *
+                (light_intensity * lit);
         }
+
+        Color result = ambient_sum + direct_sum;
 
         // 自发光最后叠加：不受光照影响，也不该被 N·L 调制
         result += glow;
@@ -156,14 +182,15 @@ struct LambertTextureShader final : public Shader {
     std::shared_ptr<Texture> normal_map; ///< 切线空间法线贴图
     std::shared_ptr<Texture> specular_map; ///< 高光遮罩（灰度，调制高光强度）
     std::shared_ptr<Texture> glow_map; ///< 自发光（眼睛、胸口宝石）
-    std::vector<glm::vec3> lights_world; ///< 光源位置（世界空间）
-    Color ambient{0.15f};                ///< 环境光系数
-    float diffuse_factor{0.45f};         ///< 漫反射系数
-    float specular{0.40f};               ///< 高光系数
-    float shininess{35.f};               ///< 高光指数
+    LightList lights;              ///< 光源列表（每个自带 diffuse/specular/ambient）
+    float light_intensity{1.f};    ///< 全局光照强度（调亮/调暗用）
     float normal_strength{1.f}; ///< 法线强度（1=原始, 0=平坦）
     float specular_gain{8.f};   ///< 高光贴图的增益（它数值很暗）
     float glow_gain{3.f};       ///< 自发光增益（它数值很暗）
+
+    const ShadowMap *shadow = nullptr; ///< 阴影贴图（不持有所有权）
+    std::size_t shadow_light = 0; ///< 哪个光源投影（lights_world 的下标）
+    float shadow_strength = 0.35f; ///< 阴影里保留多少亮度（0=全黑）
 };
 
 } // namespace
@@ -188,17 +215,81 @@ int main() {
                  mesh->vertices.size(),
                  mesh->triangle_count());
 
-    Camera camera{};
-    camera.eye = {-1.f, 0.f, 2.f};
-    camera.center = {0.f, 0.f, 0.f};
-    camera.up = {0.f, 1.f, 0.f};
-    camera.fov = glm::radians(60.f);
-    camera.n = 0.1f;
-    camera.f = 100.f;
-    camera.w = 800;
-    camera.h = 800;
+    // ---------------- 光源 pass：从主光渲染深度 ----------------
+    //
+    // 光源就是一个 View —— 同一套 Rasterizer::draw，只是矩阵不同。
+    const glm::vec3 light_pos{2.f, 3.f, 4.f};
 
-    Rasterizer r(camera);
+    // 光源视锥要紧贴模型，否则 NDC 深度的有效精度会浪费掉一大半。
+    // NDC 深度是非线性的：靠近 near 精度高，靠近 far 精度低。
+    glm::vec3 bounds_min{1e9f}, bounds_max{-1e9f};
+    for (const Vertex &v : mesh->vertices) {
+        const glm::vec3 p{v.position};
+        bounds_min = glm::min(bounds_min, p);
+        bounds_max = glm::max(bounds_max, p);
+    }
+    const glm::vec3 bounds_center = (bounds_min + bounds_max) * 0.5f;
+    const float bounds_radius = glm::length(bounds_max - bounds_min) * 0.5f;
+    const float light_dist = glm::length(light_pos - bounds_center);
+
+    View light_view{};
+    light_view.eye = light_pos;
+    light_view.center = bounds_center;
+    light_view.up = {0.f, 1.f, 0.f};
+    light_view.fov = glm::degrees(
+        2.f * std::asin(glm::min(0.99f, bounds_radius * 1.15f / light_dist)));
+    light_view.n = std::max(0.1f, light_dist - bounds_radius * 1.2f);
+    light_view.f = light_dist + bounds_radius * 1.2f;
+    light_view.w = 1024;
+    light_view.h = 1024;
+
+    std::fprintf(stderr,
+                 "light: pos(%.2f,%.2f,%.2f) fov %.1f° near %.2f far %.2f\n",
+                 light_pos.x,
+                 light_pos.y,
+                 light_pos.z,
+                 light_view.fov,
+                 light_view.n,
+                 light_view.f);
+
+    ShadowMap shadow;
+    shadow.resize(light_view.w);
+    // bias 的量级取决于深度范围：光源视锥越紧，NDC 深度的跨度越大，
+    // 同样的世界空间偏移在 NDC 里的"有效值"就越大。换视锥必须重调。
+    shadow.set_bias(0.0005f);
+    shadow.set_slope_bias(true);
+    shadow.set_view_projection(
+        glm::perspectiveFovRH_ZO(light_view.fov,
+                                 static_cast<float>(light_view.w),
+                                 static_cast<float>(light_view.h),
+                                 light_view.n,
+                                 light_view.f) *
+        glm::lookAtRH(light_view.eye, light_view.center, light_view.up));
+
+    {
+        Rasterizer light_pass(light_view);
+        // 深度 pass 不需要片段处理，用默认 shader（只做顶点变换）
+        light_pass.emplace_shader<DefaultShader>();
+        // 只清深度就够 —— 颜色不参与阴影
+        light_pass.clear(BufferType::kDepth);
+        light_pass.draw(*mesh);
+        shadow.capture(light_pass.depth_buffer());
+        std::fprintf(
+            stderr, "shadow map: %d x %d\n", shadow.size(), shadow.size());
+    }
+
+    // ---------------- 相机 pass ----------------
+    View view{};
+    view.eye = {-1.f, 0.f, 2.f};
+    view.center = {0.f, 0.f, 0.f};
+    view.up = {0.f, 1.f, 0.f};
+    view.fov = glm::radians(60.f);
+    view.n = 0.1f;
+    view.f = 100.f;
+    view.w = 800;
+    view.h = 800;
+
+    Rasterizer r(view);
 
     // 就地构造并接管所有权；emplace_shader 返回引用，方便继续设参数
     LambertTextureShader &shader = r.emplace_shader<LambertTextureShader>();
@@ -231,10 +322,32 @@ int main() {
     shader.normal_map = std::make_shared<Texture>(std::move(*normal_map));
     shader.specular_map = std::make_shared<Texture>(std::move(*specular_map));
     shader.glow_map = std::make_shared<Texture>(std::move(*glow_map));
-    shader.lights_world = {
-        {2.f, 3.f, 4.f},  // 主光：右上前方
-        {-3.f, 1.f, 2.f}, // 补光：左侧
-    };
+    // ---------------- 光源布置 ----------------
+    //
+    // 三盏灯的经典配方：主光 + 补光 + 轮廓光。每个 Light 自带 diffuse /
+    // specular / ambient / shininess，所以可以独立调。
+    //
+    //   主光  (key)  : 右前方，最亮，投射阴影，给主要明暗
+    //   补光  (fill) : 左前方，暗一些，把主光的阴影侧提亮，避免死黑
+    //   轮廓光 (rim) : 右后方，只给一点冷色，勾出边缘把它从背景里分出来
+    {
+        Light key = make_point(light_pos, Color{1.f, 0.97f, 0.90f});
+        key.ambient = Color{0.10f, 0.10f, 0.12f};   // 环境项主要挂在这
+        key.specular = Color{0.9f};
+        key.shininess = 40.f;
+
+        Light fill = make_point({-3.f, 1.f, 2.f}, Color{0.24f, 0.26f, 0.32f});
+        fill.specular = Color{0.f};                 // 补光不给高光，否则双高光很假
+        fill.shininess = 20.f;
+
+        Light rim = make_point({1.5f, 2.f, -3.5f}, Color{0.22f, 0.26f, 0.38f});
+        rim.specular = Color{0.15f};
+
+        shader.lights = {key, fill, rim};
+    }
+    shader.shadow = &shadow;
+    shader.shadow_light = 0;        // 只有主光投影
+    shader.shadow_strength = 0.35f; // 阴影里保留的亮度比例
 
     // draw() 不自动清屏，必须自己调 —— 否则 zbuffer 读的是未初始化内存
     r.clear(BufferType::kColor | BufferType::kDepth);

@@ -21,7 +21,16 @@ class Buffer {
         return buffer_[y * w_ + x];
     }
 
+    const T &operator()(int x, int y) const {
+        assert(x >= 0 && x < w_ && y >= 0 && y < h_);
+        return buffer_[y * w_ + x];
+    }
+
     T &operator()(const glm::i32vec2 &point) {
+        return this->operator()(point.x, point.y);
+    }
+
+    const T &operator()(const glm::i32vec2 &point) const {
         return this->operator()(point.x, point.y);
     }
 

@@ -10,8 +10,8 @@ struct Vertex {
     ///   w     = 1/w_clip（透视校正插值用）
     glm::vec4 position{glm::vec3{0.f}, 1.f};
 
-    glm::vec3 view_position{0.f}; ///< 相机空间位置（varying，光照用）
-    glm::vec3 normal{0.f};        ///< 相机空间法线（varying）
+    glm::vec3 world_position{0.f}; ///< 世界空间位置（varying，光照 + 阴影 + TBN）
+    glm::vec3 normal{0.f};        ///< 世界空间法线（varying）
     glm::vec2 texcoord{0.f};      ///< varying
     Color color{0.f};             ///< varying
 };

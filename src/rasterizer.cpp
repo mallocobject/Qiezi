@@ -61,19 +61,17 @@ std::size_t clip_near(const Rasterizer::ClipVertex in[3],
 }
 } // namespace
 
-Rasterizer::Rasterizer(Camera camera)
-    : buffer_(camera.w, camera.h), zbuffer_(camera.w, camera.h),
-      camera_(std::move(camera)) {
-    const int w = camera_.w;
-    const int h = camera_.h;
-    view_ = glm::lookAtRH(camera_.eye, camera_.center, camera_.up);
-    projection_ = glm::perspectiveFovRH_ZO(camera_.fov,
+Rasterizer::Rasterizer(View view)
+    : buffer_(view.w, view.h), zbuffer_(view.w, view.h),
+      view_(std::move(view)) {
+    const int w = view_.w;
+    const int h = view_.h;
+    view_matrix_ = glm::lookAtRH(view_.eye, view_.center, view_.up);
+    projection_ = glm::perspectiveFovRH_ZO(view_.fov,
                                            static_cast<float>(w),
                                            static_cast<float>(h),
-                                           camera_.n,
-                                           camera_.f);
-    // const float f1 = 0.5f * (camera_.f - camera_.n);
-    // const float f2 = 0.5f * (camera_.f + camera_.n);
+                                           view_.n,
+                                           view_.f);
     viewport_ = {
         {w / 2.f, 0, 0, 0},
         {0, h / 2.f, 0, 0},
@@ -105,7 +103,7 @@ Rasterizer::ClipVertex
 Rasterizer::interpolate(const ClipVertex &a, const ClipVertex &b, float t) {
     ClipVertex r;
     r.clip = glm::mix(a.clip, b.clip, t);
-    r.view_position = glm::mix(a.view_position, b.view_position, t);
+    r.world_position = glm::mix(a.world_position, b.world_position, t);
     r.normal = glm::mix(a.normal, b.normal, t);
     r.texcoord = glm::mix(a.texcoord, b.texcoord, t);
     r.color = glm::mix(a.color, b.color, t);
@@ -113,7 +111,7 @@ Rasterizer::interpolate(const ClipVertex &a, const ClipVertex &b, float t) {
 }
 
 void Rasterizer::draw(const IndexedMesh &mesh) {
-    const glm::mat4 mv = view_ * model_;
+    const glm::mat4 mv = view_matrix_ * model_;
 
     // 每次 draw 重新构建上下文 —— 矩阵永远是最新的，
     // 不像 lambda 捕获那样会在相机/模型改变后过期
@@ -121,7 +119,10 @@ void Rasterizer::draw(const IndexedMesh &mesh) {
     ctx.mvp = projection_ * mv;
     ctx.model_view = mv;
     ctx.model = model_;
-    ctx.camera_position = camera_.eye;
+    ctx.normal_matrix = glm::inverseTranspose(glm::mat3{model_});
+    ctx.camera_position = view_.eye;
+    // 光源矩阵由调用方设置（shadow mapping 用）。这里只保证它是"能用的"。
+    ctx.light_view_projection = light_view_projection_;
 
     // 没设 shader 时用内置默认实现。
     // 用指针而不是引用：三目运算符要求两分支同类型，引用会逼出 static_cast。
@@ -144,7 +145,7 @@ void Rasterizer::draw(const IndexedMesh &mesh) {
             continue;
         }
         clip_[v].clip = out->clip_position;
-        clip_[v].view_position = out->view_position;
+        clip_[v].world_position = out->world_position;
         clip_[v].normal = out->normal;
         clip_[v].texcoord = out->texcoord;
         clip_[v].color = out->color;
@@ -201,7 +202,7 @@ void Rasterizer::draw(const IndexedMesh &mesh) {
 
                 Vertex &dst = tri[c];
                 dst.position = glm::vec4{screen.x, screen.y, ndc.z, inv_w};
-                dst.view_position = cv.view_position;
+                dst.world_position = cv.world_position;
                 dst.normal = cv.normal;
                 dst.texcoord = cv.texcoord;
                 dst.color = cv.color;
@@ -214,6 +215,7 @@ void Rasterizer::draw(const IndexedMesh &mesh) {
 void Rasterizer::rasterize_triangle(const Triangle &tri,
                                     const Shader *shader,
                                     const ShaderContext &ctx) {
+    // ABC 必须用【屏幕空间】坐标 —— 后面拿屏幕像素去乘它
     const glm::mat3 ABC{
         {tri[0].position.x, tri[0].position.y, 1.f},
         {tri[1].position.x, tri[1].position.y, 1.f},
@@ -224,9 +226,9 @@ void Rasterizer::rasterize_triangle(const Triangle &tri,
         return; // 背面 + 亚像素三角形
     }
 
-    // 逐三角形的切线基数据（相机空间）—— 整个三角形内是常量，只算一次
-    const glm::vec3 edge1 = tri[1].view_position - tri[0].view_position;
-    const glm::vec3 edge2 = tri[2].view_position - tri[0].view_position;
+    // 逐三角形的切线基数据（世界空间）—— 整个三角形内是常量，只算一次
+    const glm::vec3 edge1 = tri[1].world_position - tri[0].world_position;
+    const glm::vec3 edge2 = tri[2].world_position - tri[0].world_position;
     const glm::vec2 duv1 = tri[1].texcoord - tri[0].texcoord;
     const glm::vec2 duv2 = tri[2].texcoord - tri[0].texcoord;
     const glm::vec3 face_normal = glm::normalize(glm::cross(edge1, edge2));
@@ -237,72 +239,95 @@ void Rasterizer::rasterize_triangle(const Triangle &tri,
         std::minmax({tri[0].position.y, tri[1].position.y, tri[2].position.y});
 
     const int x0 = std::max(0, static_cast<int>(std::floor(bbminx)));
-    const int x1 = std::min(camera_.w - 1, static_cast<int>(std::ceil(bbmaxx)));
+    const int x1 = std::min(view_.w - 1, static_cast<int>(std::ceil(bbmaxx)));
     const int y0 = std::max(0, static_cast<int>(std::floor(bbminy)));
-    const int y1 = std::min(camera_.h - 1, static_cast<int>(std::ceil(bbmaxy)));
+    const int y1 = std::min(view_.h - 1, static_cast<int>(std::ceil(bbmaxy)));
     if (x0 > x1 || y0 > y1) {
         return;
     }
 
     const glm::mat3 inv = glm::inverse(ABC);
 
+    // ------------------------------------------------------------------
+    // SSAA：每个像素取 consts::kSubSampleCount 个子样本，各自做覆盖测试和
+    // 着色，最后把颜色平均后写一次。
+    //
+    // 深度缓冲仍然【逐像素】只有一个值，所以：
+    //   - 每个子样本各自和它比较（等价于"深度测试通过就保留"）
+    //   - 写回的是【通过测试的子样本的平均深度】
+    // 这样同一个像素内多个三角形争夺时，先画的浅色会被后画的挡掉，
+    // 行为和单样本时一致。
+    //
+    // 注意这不是解析式抗锯齿（AA），是 4x 超采样 —— 边缘改善明显但
+    // 不是完美的，斜边仍会有阶梯，只是台阶细了一半。
+    // ------------------------------------------------------------------
     for (int y = y0; y <= y1; ++y) {
         for (int x = x0; x <= x1; ++x) {
-            const glm::vec3 bc = inv * glm::vec3{x + 0.5f, y + 0.5f, 1.f};
-            if (bc.x < 0.f || bc.y < 0.f || bc.z < 0.f) {
-                continue; // 覆盖测试：重心坐标有负分量 = 在三角形外
+            const float current_z = zbuffer_(x, y);
+
+            Color accum_color{0.f};
+            float accum_z = 0.f;
+            int hits = 0;
+
+            for (int s = 0; s < consts::kSubSampleCount; ++s) {
+                const float sx =
+                    static_cast<float>(x) + consts::kSubSampleOffset[s][0];
+                const float sy =
+                    static_cast<float>(y) + consts::kSubSampleOffset[s][1];
+
+                // 覆盖测试：重心坐标有负分量 = 在三角形外
+                const glm::vec3 bc = inv * glm::vec3{sx, sy, 1.f};
+                if (bc.x < 0.f || bc.y < 0.f || bc.z < 0.f) {
+                    continue;
+                }
+
+                // 深度测试（RH_ZO：z 小 = 近）
+                const float ndc_z = bc.x * tri[0].position.z +
+                                    bc.y * tri[1].position.z +
+                                    bc.z * tri[2].position.z;
+                if (ndc_z >= current_z) {
+                    continue;
+                }
+
+                // 透视校正插值：屏幕空间权重乘以 1/w 再归一化
+                glm::vec3 w{bc.x * tri[0].position.w,
+                            bc.y * tri[1].position.w,
+                            bc.z * tri[2].position.w};
+                w /= (w.x + w.y + w.z);
+
+                FragmentIn fin;
+                fin.screen_position = glm::vec3{sx, sy, ndc_z};
+                fin.world_position = tri[0].world_position * w.x +
+                                     tri[1].world_position * w.y +
+                                     tri[2].world_position * w.z;
+                fin.normal =
+                    tri[0].normal * w.x + tri[1].normal * w.y + tri[2].normal * w.z;
+                fin.texcoord = tri[0].texcoord * w.x + tri[1].texcoord * w.y +
+                               tri[2].texcoord * w.z;
+                fin.color = tri[0].color * w.x + tri[1].color * w.y +
+                            tri[2].color * w.z;
+                fin.edge1 = edge1;
+                fin.edge2 = edge2;
+                fin.duv1 = duv1;
+                fin.duv2 = duv2;
+                fin.face_normal = face_normal;
+
+                const std::optional<Color> out = shader->fragment(fin, ctx);
+                if (!out) {
+                    continue; // hook 丢弃了这个子样本（镂空等）
+                }
+
+                accum_color += *out;
+                accum_z += ndc_z;
+                ++hits;
             }
 
-            // ---- 固定功能：深度测试 ----
-            const float ndc_z = glm::dot(bc,
-                                         glm::vec3{tri[0].position.z,
-                                                   tri[1].position.z,
-                                                   tri[2].position.z});
-            if (ndc_z >= zbuffer_(x, y)) {
-                continue; // RH_ZO：z 小 = 近
+            if (hits == 0) {
+                continue; // 这个像素没有任何子样本通过
             }
 
-            // ---- 固定功能：透视校正插值 ----
-            // 屏幕空间权重除以 w 再归一化，得到透视正确的插值权重
-            glm::vec3 w{bc.x * tri[0].position.w,
-                        bc.y * tri[1].position.w,
-                        bc.z * tri[2].position.w};
-            w /= (w.x + w.y + w.z);
-
-            const glm::vec3 view_position = tri[0].view_position * w.x +
-                                            tri[1].view_position * w.y +
-                                            tri[2].view_position * w.z;
-            const glm::vec3 normal =
-                tri[0].normal * w.x + tri[1].normal * w.y + tri[2].normal * w.z;
-
-            const glm::vec2 texcoord = tri[0].texcoord * w.x +
-                                       tri[1].texcoord * w.y +
-                                       tri[2].texcoord * w.z;
-            const Color color =
-                tri[0].color * w.x + tri[1].color * w.y + tri[2].color * w.z;
-
-            // ---- 片段处理 ----
-            FragmentIn fin;
-            fin.screen_position = glm::vec3{static_cast<float>(x) + 0.5f,
-                                            static_cast<float>(y) + 0.5f,
-                                            ndc_z};
-            fin.view_position = view_position;
-            fin.normal = normal;
-            fin.texcoord = texcoord;
-            fin.color = color;
-            fin.edge1 = edge1;
-            fin.edge2 = edge2;
-            fin.duv1 = duv1;
-            fin.duv2 = duv2;
-            fin.face_normal = face_normal;
-            const std::optional<Color> out = shader->fragment(fin, ctx);
-
-            if (!out) {
-                continue; // hook 丢弃了这个片段（镂空等）
-            }
-
-            zbuffer_(x, y) = ndc_z;
-            set_pixel(x, y, *out);
+            zbuffer_(x, y) = accum_z / static_cast<float>(hits);
+            set_pixel(x, y, accum_color / static_cast<float>(hits));
         }
     }
 }

@@ -23,11 +23,27 @@
 #include <optional>
 
 /// 每次着色调用都传的全局状态。矩阵在这里，所以永远和当前相机一致。
+///
+/// 空间约定：所有 varying（位置、法线）都在【世界空间】。光照、阴影投影、
+/// TBN 的边向量共用这一套坐标，shader 里不需要来回变换。
 struct ShaderContext {
-    glm::mat4 mvp{1.f};             ///< model * view * projection
-    glm::mat4 model_view{1.f};      ///< view * model（相机空间）
-    glm::mat4 model{1.f};           ///< 模型矩阵（世界空间变换用）
-    glm::vec3 camera_position{0.f}; ///< 相机在世界空间的位置
+    glm::mat4 mvp{1.f};        ///< model * view * projection
+    /// view * model。**当前没有任何 shader 用它** —— 光照和 TBN 都改成
+    /// 世界空间之后就不需要了。留着是因为做屏幕空间效果、深度线性化、
+    /// 或者切回相机空间光照时可能要用；确认不需要可以删（省 64 字节/帧）。
+    glm::mat4 model_view{1.f};
+    glm::mat4 model{1.f};      ///< 模型矩阵（世界空间变换用）
+
+    /// 法线矩阵 = transpose(inverse(mat3(model)))，由 rasterizer 每次 draw
+    /// 算一次。
+    glm::mat3 normal_matrix{1.f};
+    glm::vec3 camera_position{0.f}; ///< 观察者（相机）在世界空间的位置
+
+    // ---- shadow mapping ----
+    //
+    // 光源也是个 View，所以它的矩阵也该在这里传 —— shader 里存矩阵会在
+    // 光源移动后过期，而 ctx 每次 draw 都重建。
+    glm::mat4 light_view_projection{1.f}; ///< 光源的 view * projection
 };
 
 /// 顶点处理的输入：模型空间的一个顶点。
@@ -41,18 +57,18 @@ struct VertexIn {
 /// 顶点处理的输出：裁剪空间位置 + 要传给片段的 varying。
 struct VertexOut {
     glm::vec4 clip_position{0.f}; ///< 裁剪空间位置（光栅化器做透视除法）
-    glm::vec3 view_position{0.f}; ///< 相机空间位置（varying）
-    glm::vec3 normal{0.f};        ///< 相机空间法线（varying）
-    glm::vec2 texcoord{0.f};      ///< varying
-    Color color{0.f};             ///< varying
+    glm::vec3 world_position{0.f}; ///< 世界空间位置（varying）
+    glm::vec3 normal{0.f};         ///< 世界空间法线（varying）
+    glm::vec2 texcoord{0.f};       ///< varying
+    Color color{0.f};              ///< varying
 };
 
 /// 片段处理的输入：光栅化器插值好的属性。
 struct FragmentIn {
     glm::vec3 screen_position{0.f}; ///< 屏幕空间位置，z = ndc.z
-    glm::vec3 view_position{0.f}; ///< 相机空间位置（相机在原点，看向 -z）
+    glm::vec3 world_position{0.f};  ///< 世界空间位置（varying）
 
-    glm::vec3 normal{0.f}; ///< 透视校正插值后的法线（相机空间）
+    glm::vec3 normal{0.f}; ///< 透视校正插值后的法线（世界空间）
     glm::vec2 texcoord{0.f}; ///< 透视校正插值后的 UV
     Color color{0.f};        ///< 透视校正插值后的顶点色
 
@@ -64,21 +80,23 @@ struct FragmentIn {
     //     T   = (edge1*duv2.y - edge2*duv1.y) / det    // 切线（未归一化）
     //     B   = cross(N, T) * sign(det)                // 副切线，手性看 det
     //
-    // 逐三角形算而不是逐顶点预计算：这个模型有 53.66% 的三角形 UV 手性翻转
-    // （det<0），且顶点法线与面法线夹角平均 31°（大量硬边），
-    // 逐顶点平均出的切线在硬边处会错位。
+    // edge1/edge2 和 normal 必须【在同一个空间】—— 因为切线要和法线做
+    // Gram-Schmidt 正交化。现在统一在世界空间。
 
-    glm::vec3 edge1{0.f}; ///< P1 - P0（相机空间）
-    glm::vec3 edge2{0.f}; ///< P2 - P0（相机空间）
+    glm::vec3 edge1{0.f}; ///< P1 - P0（世界空间）
+    glm::vec3 edge2{0.f}; ///< P2 - P0（世界空间）
     glm::vec2 duv1{0.f};  ///< U1 - U0
     glm::vec2 duv2{0.f};  ///< U2 - U0
-    glm::vec3 face_normal{0.f}; ///< 三角形面法线（相机空间，已归一化）
+    glm::vec3 face_normal{0.f}; ///< 三角形面法线（世界空间，已归一化）
 };
 
 /// 着色器基类。
 ///
 /// 派生类只需要重写 fragment()；vertex() 的默认实现是
-/// "mvp 变换 + 法线变到相机空间 + 属性原样透传"。
+/// "mvp 变换 + 位置和法线变到世界空间 + 属性原样透传"。
+///
+/// 空间约定：所有 varying 都在【世界空间】—— 光照、阴影投影、TBN 的边向量
+/// 共用同一套坐标，不需要在 shader 里来回变换。
 struct Shader {
     virtual ~Shader() = default;
 
@@ -87,9 +105,10 @@ struct Shader {
                                             const ShaderContext &ctx) const {
         VertexOut out;
         out.clip_position = ctx.mvp * glm::vec4{in.position, 1.f};
-        out.view_position =
-            glm::vec3{ctx.model_view * glm::vec4{in.position, 1.f}};
-        out.normal = glm::mat3{ctx.model_view} * in.normal;
+        out.world_position = glm::vec3{ctx.model * glm::vec4{in.position, 1.f}};
+        // 法线用【模型矩阵的逆转置】（世界空间）。这样它和 world_position
+        // 导出的切线在同一空间，非等比缩放时也正确。
+        out.normal = ctx.normal_matrix * in.normal;
         out.texcoord = in.texcoord;
         out.color = in.color;
         return out;

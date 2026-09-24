@@ -26,4 +26,12 @@ inline constexpr const float kMinTriangleArea2 = 1.f;
 /// w 必须严格大于 0 才能安全地做除法。
 inline constexpr float kNearPlaneEps = 1e-4f;
 
+/// 每个像素的子样本偏移（SSAA）。
+///
+/// 2x2 网格，坐标在每个像素内取 [0,1]，所以是 (0.25, 0.75) 四个组合。
+/// 顺序无所谓 —— 下面只是加权平均。
+inline constexpr int kSubSampleCount = 4;
+inline constexpr float kSubSampleOffset[4][2] = {
+    {0.375f, 0.125f}, {0.875f, 0.375f}, {0.125f, 0.625f}, {0.625f, 0.875f}};
+
 } // namespace consts
